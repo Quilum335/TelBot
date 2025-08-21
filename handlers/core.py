@@ -399,8 +399,6 @@ def register_handlers(dp, bot):
     dp.callback_query.register(delete_post, F.data.startswith("delete_post_"))
     dp.callback_query.register(confirm_delete, F.data.startswith("confirm_delete_"))
 
-    # Самый последний: обработчик любого текста -> главное меню
-    dp.message.register(fallback_to_menu, F.text)
     dp.callback_query.register(change_donor, F.data.startswith("change_donor_"))
     dp.message.register(process_new_donor, ScheduledPostsStates.waiting_for_new_donor)
     
@@ -616,16 +614,7 @@ async def cmd_menu(message: types.Message):
         reply_markup=get_main_menu_keyboard(user_info)
     )
 
-# Catch-all text handler: open main menu for any unrelated text
-async def fallback_to_menu(message: types.Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or str(user_id)
-    has_access, error_message = await check_user_access(user_id, username)
-    if not has_access:
-        await message.answer(error_message)
-        return
-    user_info = await get_user_info(user_id, username)
-    await message.answer("📋 Главное меню", reply_markup=get_main_menu_keyboard(user_info))
+# (удалено) обработчик любого текста
 
 async def cmd_admin(message: types.Message, state: FSMContext):
     """Обработка команды /admin54"""
@@ -693,8 +682,12 @@ async def list_channels(callback: types.CallbackQuery):
 # Обработчики для создания постов
 async def post_manual(callback: types.CallbackQuery, state: FSMContext):
     """Ручной режим создания поста"""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     await callback.message.edit_text(
-        "⏰ Введите время публикации в формате HH:MM (например, 13:32):"
+        "⏰ Введите время публикации в формате HH:MM (например, 13:32):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+        ])
     )
     await state.set_state(PostStates.waiting_for_time)
 
