@@ -332,7 +332,8 @@ async def create_user_database(user_id: int, username: str):
                 phone_number TEXT, -- аккаунт, через который читается донор
                 is_public_channel BOOLEAN DEFAULT 0, -- флаг для публичных каналов
                 post_freshness INTEGER DEFAULT 1, -- свежесть постов в днях (1=день, 7=неделя, 14=2 недели, 30=месяц, 90=3 месяца, 365=год)
-                is_active BOOLEAN DEFAULT 1 -- флаг активности потока
+                is_active BOOLEAN DEFAULT 1, -- флаг активности потока
+                repost_mode TEXT DEFAULT 'online' -- режим репостов: 'online' или 'random'
             )
         ''')
         
@@ -600,6 +601,26 @@ async def migrate_repost_streams_is_active_table(db_path: str):
     except Exception:
         logger.exception("Ошибка миграции repost_streams для", extra={"db_path": db_path})
 
+async def migrate_repost_streams_repost_mode_table(db_path: str):
+    """Миграция таблицы repost_streams для добавления поля repost_mode"""
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            # Проверяем, есть ли поле repost_mode
+            cursor = await db.execute("PRAGMA table_info(repost_streams)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            if 'repost_mode' not in column_names:
+                # Добавляем поле repost_mode
+                await db.execute('ALTER TABLE repost_streams ADD COLUMN repost_mode TEXT DEFAULT \'online\'')
+                await db.commit()
+                logger.info("Миграция выполнена для", extra={"db_path": db_path, "field": "repost_mode"})
+            else:
+                logger.debug("Миграция не требуется для", extra={"db_path": db_path, "field": "repost_mode"})
+                
+    except Exception:
+        logger.exception("Ошибка миграции repost_streams для", extra={"db_path": db_path})
+
 async def cleanup_bad_random_posts(db_path: str):
     """Очистка проблемных записей рандомных постов"""
     try:
@@ -704,6 +725,7 @@ async def migrate_all_databases():
                     await migrate_periodic_posts_table(db_file) # Добавляем миграцию для periodic_posts
                     await migrate_posts_table_for_random_posts(db_file) # Добавляем миграцию для posts
                     await migrate_published_dedup_table(db_file) # Таблица для дедупликации опубликованных постов
+                    await migrate_repost_streams_repost_mode_table(db_file) # Добавляем миграцию для repost_mode
                     
                     # Исправляем некорректные JSON данные
                     await fix_corrupted_json_data(db_file)
@@ -726,6 +748,7 @@ async def get_scheduled_posts(user_id: int, username: str):
     
     async with aiosqlite.connect(db_path) as db:
         now = datetime.now()
+        now_iso = now.isoformat()
         
         # Получаем обычные посты из таблицы posts (только будущие)
         cursor = await db.execute('''
@@ -734,9 +757,9 @@ async def get_scheduled_posts(user_id: int, username: str):
                    c.channel_title
             FROM posts p
             LEFT JOIN channels c ON p.channel_id = c.channel_id
-            WHERE p.is_published = 0 AND p.content_type != 'random' AND p.scheduled_time > datetime('now','localtime')
+            WHERE p.is_published = 0 AND p.content_type != 'random' AND p.scheduled_time > ?
             ORDER BY p.scheduled_time ASC
-        ''')
+        ''', (now_iso,))
         posts = await cursor.fetchall()
         
         # Получаем рандомные посты из таблицы posts (только будущие)
@@ -747,14 +770,14 @@ async def get_scheduled_posts(user_id: int, username: str):
                    p.post_freshness, p.phone_number, p.is_public_channel, p.random_post_id
             FROM posts p
             LEFT JOIN channels c ON p.channel_id = c.channel_id
-            WHERE p.is_published = 0 AND p.content_type = 'random' AND p.scheduled_time > datetime('now','localtime')
+            WHERE p.is_published = 0 AND p.content_type = 'random' AND p.scheduled_time > ?
             ORDER BY p.scheduled_time ASC
-        ''')
+        ''', (now_iso,))
         random_posts = await cursor.fetchall()
         
         # Получаем потоки репостов
         cursor = await db.execute('''
-            SELECT id, donor_channel, target_channels, phone_number, is_public_channel, post_freshness
+            SELECT id, donor_channel, target_channels, phone_number, is_public_channel, post_freshness, repost_mode
             FROM repost_streams
         ''')
         repost_streams = await cursor.fetchall()

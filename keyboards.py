@@ -96,6 +96,31 @@ def get_periodic_source_keyboard():
     )
     return keyboard.as_markup()
 
+def get_repost_mode_keyboard():
+    """Выбор режима репостов: онлайн или рандомный"""
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="🔄 Онлайн режим", callback_data="repost_mode_online"),
+        InlineKeyboardButton(text="🎲 Рандомный режим", callback_data="repost_mode_random")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="ℹ️ Описание режимов", callback_data="repost_modes_info"),
+        InlineKeyboardButton(text="◀️ Назад", callback_data="periodic_source_public")
+    )
+    return keyboard.as_markup()
+
+def get_repost_modes_info_keyboard():
+    """Информация о режимах репостов"""
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="🔄 Онлайн режим", callback_data="repost_mode_online"),
+        InlineKeyboardButton(text="🎲 Рандомный режим", callback_data="repost_mode_random")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="◀️ Назад", callback_data="repost_mode_select")
+    )
+    return keyboard.as_markup()
+
 def get_channel_sort_keyboard():
     """Сортировка каналов"""
     keyboard = InlineKeyboardBuilder()

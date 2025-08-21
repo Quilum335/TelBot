@@ -58,7 +58,8 @@ from keyboards import (
     get_donor_type_keyboard, get_manage_binding_keyboard, get_accounts_menu_keyboard,
     get_accounts_list_keyboard, get_accounts_for_channels_keyboard,
     get_manage_channels_for_account_keyboard, get_channels_list_keyboard, get_manage_posts_keyboard,
-    get_donor_count_keyboard, get_periodic_donor_count_keyboard, get_donors_confirm_keyboard
+    get_donor_count_keyboard, get_periodic_donor_count_keyboard, get_donors_confirm_keyboard,
+    get_repost_mode_keyboard, get_repost_modes_info_keyboard,
 )
 from utils import clean_post_content
 from schu import PostScheduler
@@ -362,6 +363,12 @@ def register_handlers(dp, bot):
     dp.callback_query.register(donor_count_many, F.data == "donor_count_many")
     dp.callback_query.register(periodic_count_one, F.data == "periodic_count_one")
     dp.callback_query.register(periodic_count_many, F.data == "periodic_count_many")
+    
+    # Новые обработчики для режимов репостов
+    dp.callback_query.register(repost_mode_select, F.data == "repost_mode_select")
+    dp.callback_query.register(repost_modes_info, F.data == "repost_modes_info")
+    dp.callback_query.register(repost_mode_online, F.data == "repost_mode_online")
+    dp.callback_query.register(repost_mode_random, F.data == "repost_mode_random")
     
     # Новые обработчики для рандомных постов
     dp.callback_query.register(random_donor_select, F.data.startswith("random_donor_"))
@@ -744,11 +751,27 @@ async def process_calendar(callback: types.CallbackQuery, state: FSMContext):
                     show_alert=True
                 )
                 return
+        
+        # Добавляем минимальный интервал (2 минуты) для планирования
+        selected_time = datetime(year, month, day, post_hour, post_minute)
+        min_scheduled_time = now + timedelta(minutes=2)
+        if selected_time <= min_scheduled_time:
+            await callback.answer(
+                "❌ Пост должен быть запланирован минимум на 2 минуты вперед!",
+                show_alert=True
+            )
+            return
+        
         await state.update_data(post_date=f"{year}-{month:02d}-{day:02d}")
         data_state = await state.get_data()
         post_time = data_state.get("post_time", "00:00")
         post_date = data_state.get("post_date", f"{year}-{month:02d}-{day:02d}")
         full_datetime = f"{post_date} {post_time}"
+        
+        # Показываем подтверждение времени
+        formatted_time = selected_time.strftime("%d.%m.%Y %H:%M")
+        await callback.answer(f"✅ Время выбрано: {formatted_time}", show_alert=True)
+        
         if data_state.get("is_repost"):
             user_id = callback.from_user.id
             username = callback.from_user.username or str(user_id)
@@ -930,7 +953,41 @@ async def process_public_channel_input(message: types.Message, state: FSMContext
     await state.update_data(public_channel=channel)
 
     data = await state.get_data()
-    if data.get("periodic_flow") == "public":
+    repost_mode = data.get("repost_mode")
+    
+    if repost_mode in ["online", "random"]:
+        # После ввода донора предлагаем выбрать целевые каналы
+        user_id = message.from_user.id
+        username = message.from_user.username or str(user_id)
+        channels = await _fetch_user_channels(user_id, username)
+        if not channels:
+            await message.answer("❌ У вас нет привязанных каналов. Сначала привяжите каналы в меню.")
+            await state.clear()
+            return
+        
+        mode_text = "🔄 Онлайн режим" if repost_mode == "online" else "🎲 Рандомный режим"
+        mode_description = (
+            "• Посты публикуются в указанный целевой канал" if repost_mode == "online"
+            else "• Каждый пост публикуется в случайный целевой канал"
+        )
+        
+        await _render_select_list(
+            message,
+            items=channels,
+            selected_ids=[],
+            build_callback_prefix="public_periodic_target",
+            title_text=(
+                f"📥 {mode_text}\n\n"
+                f"📡 Донор: {channel}\n"
+                f"ℹ️ {mode_description}\n\n"
+                "Выберите целевые каналы (можно несколько):"
+            ),
+            done_callback="public_periodic_targets_selected",
+            back_callback="repost_mode_select",
+        )
+        await state.set_state(PostStates.waiting_for_auto_targets)
+        await state.update_data(selected_targets=[])
+    elif data.get("periodic_flow") == "public":
         # После ввода донора предлагаем выбрать целевые каналы
         user_id = message.from_user.id
         username = message.from_user.username or str(user_id)
@@ -1000,23 +1057,35 @@ async def target_channels_selected(callback: types.CallbackQuery, state: FSMCont
     if not selected_channels:
         await callback.answer("Выберите хотя бы один канал", show_alert=True)
         return
+    
     # Build scheduled datetime
     post_time: str = data.get('post_time')  # HH:MM
     post_date: str = data.get('post_date')  # YYYY-MM-DD
     if not post_time or not post_date:
         await send_error_message(callback, "Не задана дата/время публикации", back_callback="create_post")
         return
+    
     try:
         scheduled_dt = datetime.fromisoformat(f"{post_date} {post_time}")
+        now = datetime.now()
+        
+        # Проверяем, что время не в прошлом
+        if scheduled_dt <= now:
+            await send_error_message(callback, "❌ Нельзя запланировать пост на прошедшее время!", back_callback="create_post")
+            return
+            
     except Exception:
         await send_error_message(callback, "Некорректная дата/время", back_callback="create_post")
         return
+    
     # Use ISO format so string comparisons with datetime.now().isoformat() are correct
     scheduled_str = scheduled_dt.isoformat()
+    
     # Collect content
     content_type = data.get('content_type') or ('repost' if data.get('post_type') == 'channel' else 'text')
     content = data.get('content', '') or ''
     media_id = data.get('media_id')
+    
     # For repost from channel, compose content as marker: repost_{source_channel_id}_{source_post_id}
     if content_type == 'repost':
         source_channel_id = data.get('source_channel_id')
@@ -1026,10 +1095,23 @@ async def target_channels_selected(callback: types.CallbackQuery, state: FSMCont
             return
         content = f"repost_{int(source_channel_id)}_{int(source_post_id)}"
         media_id = None
+    
+    # Создаем описание поста для отображения
+    post_description = ""
+    if content_type == "text":
+        post_description = f"📝 Текстовый пост: {content[:50]}{'...' if len(content) > 50 else ''}"
+    elif content_type == "photo":
+        post_description = f"🖼 Фото с подписью: {content[:50]}{'...' if len(content) > 50 else ''}"
+    elif content_type == "video":
+        post_description = f"🎥 Видео с подписью: {content[:50]}{'...' if len(content) > 50 else ''}"
+    elif content_type == "repost":
+        post_description = f"🔄 Репост поста #{source_post_id}"
+    
     # Insert posts for each selected channel
     user_id = callback.from_user.id
     username = callback.from_user.username or str(user_id)
     db_path = await get_user_db_path(user_id, username)
+    
     async with aiosqlite.connect(db_path) as db:
         for channel_id in selected_channels:
             await db.execute(
@@ -1049,8 +1131,19 @@ async def target_channels_selected(callback: types.CallbackQuery, state: FSMCont
                 )
             )
         await db.commit()
+    
     await state.clear()
-    await send_success_message(callback, "✅ Пост(ы) запланированы", back_callback="scheduled_posts")
+    
+    # Показываем детали запланированного поста
+    formatted_time = scheduled_dt.strftime("%d.%m.%Y %H:%M")
+    success_text = (
+        f"✅ Пост(ы) запланированы!\n\n"
+        f"📝 Описание: {post_description}\n"
+        f"⏰ Время публикации: {formatted_time}\n"
+        f"📢 Каналы: {len(selected_channels)}"
+    )
+    
+    await send_success_message(callback, success_text, back_callback="scheduled_posts")
 
 async def channel_names_auto(callback: types.CallbackQuery, state: FSMContext):
     """Автоматическая генерация названий каналов"""
@@ -1110,7 +1203,7 @@ async def show_stream_details(callback: types.CallbackQuery, state: FSMContext):
     
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute('''
-            SELECT donor_channel, target_channels, last_message_id, phone_number, is_public_channel, post_freshness
+            SELECT donor_channel, target_channels, last_message_id, phone_number, is_public_channel, post_freshness, repost_mode
             FROM repost_streams
             WHERE id = ?
         ''', (stream_id,))
@@ -1120,7 +1213,11 @@ async def show_stream_details(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("❌ Поток не найден", show_alert=True)
             return
         
-        donor_channel, target_channels, last_message_id, phone_number, is_public_channel, post_freshness = stream
+        donor_channel, target_channels, last_message_id, phone_number, is_public_channel, post_freshness, repost_mode = stream
+        
+        # Если поле repost_mode отсутствует (старые базы), устанавливаем значение по умолчанию
+        if repost_mode is None:
+            repost_mode = 'online'
         
         # Парсим целевые каналы
         if target_channels and target_channels.startswith('['):
@@ -1135,8 +1232,18 @@ async def show_stream_details(callback: types.CallbackQuery, state: FSMContext):
             result = await cursor.fetchone()
             target_names.append(result[0] if result else str(target_id))
         
+        # Определяем режим и его описание
+        mode_icon = "🔄" if repost_mode == "online" else "🎲"
+        mode_text = "Онлайн режим" if repost_mode == "online" else "Рандомный режим"
+        mode_description = (
+            "• Посты публикуются в указанный целевой канал" if repost_mode == "online"
+            else "• Каждый пост публикуется в случайный целевой канал"
+        )
+        
         # Формируем текст с информацией о потоке
-        text = f"🔄 Детали потока репостов #{stream_id}\n\n"
+        text = f"{mode_icon} Детали потока репостов #{stream_id}\n\n"
+        text += f"🎯 Режим: {mode_text}\n"
+        text += f"ℹ️ {mode_description}\n\n"
         text += f"📡 Донор: {donor_channel}\n"
         text += f"📊 Целевые каналы ({len(target_names)}):\n"
         
@@ -1147,7 +1254,7 @@ async def show_stream_details(callback: types.CallbackQuery, state: FSMContext):
 
         
         if last_message_id:
-            text += f"📝 Пос: {last_message_id}\n"
+            text += f"📝 Последний пост: {last_message_id}\n"
         
         from keyboards import get_post_action_keyboard
         await callback.message.edit_text(
@@ -2016,16 +2123,56 @@ async def periodic_source_linked(callback: types.CallbackQuery):
     await callback.answer("Поток из привязанных: настройка скоро")
 
 async def periodic_source_public(callback: types.CallbackQuery, state: FSMContext):
-    # Старт настройки потока из публичного канала: просим ввести донор(ов)
-    data = await state.get_data()
-    allow_multi = bool(data.get('periodic_allow_multiple', False))
-    hint = "одного" if not allow_multi else "одного или нескольких (через запятую)"
+    """Источник: публичный канал для потока репостов"""
     await callback.message.edit_text(
-        f"Введите @username или ссылку на публичный канал-донора — {hint}:" 
-        "\nНапример: @telegrammm, https://t.me/telegrammm"
+        "🎯 Выберите режим репостов:",
+        reply_markup=get_repost_mode_keyboard()
     )
-    # Помечаем, что мы настраиваем поток репостов из публичного канала
-    await state.update_data(periodic_flow="public", selected_targets=[])
+    await state.set_state(PostStates.waiting_for_repost_mode)
+
+async def repost_mode_select(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор режима репостов"""
+    await callback.message.edit_text(
+        "🎯 Выберите режим репостов:",
+        reply_markup=get_repost_mode_keyboard()
+    )
+    await state.set_state(PostStates.waiting_for_repost_mode)
+
+async def repost_modes_info(callback: types.CallbackQuery):
+    """Информация о режимах репостов"""
+    info_text = (
+        "ℹ️ **Описание режимов репостов:**\n\n"
+        "🔄 **Онлайн режим:**\n"
+        "• Посты публикуются в указанный целевой канал\n"
+        "• Работает как обычный поток репостов\n"
+        "• Подходит для моно-каналов\n\n"
+        "🎲 **Рандомный режим:**\n"
+        "• Каждый пост публикуется в случайный целевой канал\n"
+        "• Если каналов несколько, выбирается случайный\n"
+        "• Подходит для мульти-каналов\n\n"
+        "Выберите режим для продолжения:"
+    )
+    await callback.message.edit_text(
+        info_text,
+        reply_markup=get_repost_modes_info_keyboard()
+    )
+
+async def repost_mode_online(callback: types.CallbackQuery, state: FSMContext):
+    """Онлайн режим репостов"""
+    await state.update_data(repost_mode="online")
+    await callback.message.edit_text(
+        "🔄 **Онлайн режим репостов**\n\n"
+        "📤 Введите @username или ссылку на канал-донор:"
+    )
+    await state.set_state(PostStates.waiting_for_public_channel_input)
+
+async def repost_mode_random(callback: types.CallbackQuery, state: FSMContext):
+    """Рандомный режим репостов"""
+    await state.update_data(repost_mode="random")
+    await callback.message.edit_text(
+        "🎲 **Рандомный режим репостов**\n\n"
+        "📤 Введите @username или ссылку на канал-донор:"
+    )
     await state.set_state(PostStates.waiting_for_public_channel_input)
 
 async def random_donor_select(callback: types.CallbackQuery, state: FSMContext):
@@ -2916,9 +3063,19 @@ async def create_repost_stream_from_state(callback: types.CallbackQuery, state: 
     donor_channel = data.get('public_channel')
     donor_list = data.get('public_channel_list')
     targets: list[int] = data.get('selected_targets', []) or []
+    repost_mode = data.get('repost_mode', 'online')
+    
     if not donor_channel and not donor_list or not targets:
         await callback.answer("Укажите донора и выберите целевые каналы", show_alert=True)
         return
+    
+    # Создаем описание потока
+    mode_text = "🔄 Онлайн режим" if repost_mode == "online" else "🎲 Рандомный режим"
+    mode_description = (
+        "• Посты публикуются в указанный целевой канал" if repost_mode == "online"
+        else "• Каждый пост публикуется в случайный целевой канал"
+    )
+    
     db_path = await get_user_db_path(user_id, username)
     async with aiosqlite.connect(db_path) as db:
         if donor_list and isinstance(donor_list, list):
@@ -2927,26 +3084,39 @@ async def create_repost_stream_from_state(callback: types.CallbackQuery, state: 
                     """
                     INSERT INTO repost_streams (
                         donor_channel, target_channels, last_message_id, phone_number,
-                        is_public_channel, post_freshness, is_active
-                    ) VALUES (?, ?, 0, ?, 1, 0, 1)
+                        is_public_channel, post_freshness, is_active, repost_mode
+                    ) VALUES (?, ?, 0, ?, 1, 0, 1, ?)
                     """,
-                    (donor, json.dumps(targets), "")
+                    (donor, json.dumps(targets), "", repost_mode)
                 )
         else:
             await db.execute(
                 """
                 INSERT INTO repost_streams (
                     donor_channel, target_channels, last_message_id, phone_number,
-                    is_public_channel, post_freshness, is_active
-                ) VALUES (?, ?, 0, ?, 1, 0, 1)
+                    is_public_channel, post_freshness, is_active, repost_mode
+                ) VALUES (?, ?, 0, ?, 1, 0, 1, ?)
                 """,
-                (donor_channel, json.dumps(targets), "")
+                (donor_channel, json.dumps(targets), "", repost_mode)
             )
         await db.commit()
+    
     await state.clear()
-    # Покажем главное меню сразу после создания потока
-    user_info = await get_user_info(user_id, username)
-    await callback.message.edit_text("✅ Поток репостов создан!", reply_markup=get_main_menu_keyboard(user_info))
+    
+    # Показываем детали созданного потока
+    donor_display = donor_channel or f"{len(donor_list)} каналов" if donor_list else "Неизвестно"
+    success_text = (
+        f"✅ Поток репостов создан!\n\n"
+        f"🎯 Режим: {mode_text}\n"
+        f"📡 Донор: {donor_display}\n"
+        f"📥 Целевые каналы: {len(targets)}\n"
+        f"ℹ️ {mode_description}"
+    )
+    
+    await callback.message.edit_text(
+        success_text,
+        reply_markup=get_main_menu_keyboard(await get_user_info(user_id, username))
+    )
 
 async def create_channels_for_account(callback: types.CallbackQuery, state: FSMContext):
     # Переиспользуем существующий флоу создания каналов

@@ -32,6 +32,11 @@ class PostStates(StatesGroup):
     waiting_for_confirm_periodic = State()
     waiting_for_confirm_random = State()
     waiting_for_confirm_single = State()
+    
+    # Новые состояния для режимов репостов
+    waiting_for_repost_mode = State()  # Выбор режима: онлайн или рандомный
+    waiting_for_online_targets = State()  # Выбор целевых каналов для онлайн режима
+    waiting_for_random_targets = State()  # Выбор целевых каналов для рандомного режима
 
 class AccountStates(StatesGroup):
     waiting_for_phone = State()
