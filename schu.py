@@ -86,6 +86,11 @@ class PostScheduler:
         
     async def scheduler_loop(self):
         """Основной цикл планировщика"""
+        # При старте сразу планируем текущий день (если слоты ещё не созданы)
+        try:
+            await self.generate_today_random_posts()
+        except Exception:
+            pass
         while self.running:
             try:
                 await self.check_scheduled_posts()
