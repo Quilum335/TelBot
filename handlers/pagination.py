@@ -320,13 +320,22 @@ async def display_scheduled_posts_paginated(callback: types.CallbackQuery, posts
             button_text = f"📺 {channel_name} | {formatted_time}"
             keyboard.row(InlineKeyboardButton(text=button_text, callback_data=f"show_post_details_{post_id}"))
         elif post_type == "stream":
-            stream_id, donor_channel, target_channels, phone_number, is_public_channel, post_freshness = post
+            stream_id, donor_channel, target_channels, phone_number, is_public_channel, post_freshness, repost_mode = post
             if target_channels and target_channels.startswith('['):
                 target_channels_list = safe_json_loads(target_channels, [])
             else:
                 target_channels_list = [int(cid.strip()) for cid in target_channels.split(',') if cid.strip()] if target_channels else []
             channels_count = len(target_channels_list) if isinstance(target_channels_list, list) else 0
-            button_text = f"🔄 {donor_channel} → {channels_count} каналов"
+            
+            # Если поле repost_mode отсутствует (старые базы), устанавливаем значение по умолчанию
+            if repost_mode is None:
+                repost_mode = 'online'
+            
+            # Добавляем информацию о режиме
+            mode_icon = "🔄" if repost_mode == "online" else "🎲"
+            mode_text = "Онлайн" if repost_mode == "online" else "Рандом"
+            
+            button_text = f"{mode_icon} {donor_channel} → {channels_count} каналов ({mode_text})"
             keyboard.row(InlineKeyboardButton(text=button_text, callback_data=f"show_stream_details_{stream_id}"))
         elif post_type == "random_stream_config":
             stream_id, donor_channels, target_channels, min_interval_hours, max_interval_hours, posts_per_day, post_freshness, is_active, last_post_time, phone_number, is_public_channel, next_post_times_json = post
