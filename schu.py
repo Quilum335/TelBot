@@ -86,26 +86,12 @@ class PostScheduler:
         
     async def scheduler_loop(self):
         """Основной цикл планировщика"""
-        # Первый раз — сразу пытаемся дозаполнить расписания на сегодня
-        try:
-            await self.generate_today_random_posts()
-            self._last_backfill_time = datetime.now()
-        except Exception:
-            pass
         while self.running:
             try:
                 await self.check_scheduled_posts()
                 await self.check_repost_streams()
                 await self.check_random_posts()
                 await self.check_periodic_posts()  # Добавляем проверку периодических постов
-                # Каждые ~15 минут пытаемся дозаполнить слоты на сегодня (на случай нового потока)
-                try:
-                    now = datetime.now()
-                    if not self._last_backfill_time or (now - self._last_backfill_time).total_seconds() >= 15 * 60:
-                        await self.generate_today_random_posts()
-                        self._last_backfill_time = now
-                except Exception:
-                    pass
                 await asyncio.sleep(5)  # Проверяем чаще для точности публикаций
             except Exception as e:
                 logger.error(f"Ошибка в цикле планировщика: {e}")

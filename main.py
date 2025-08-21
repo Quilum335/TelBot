@@ -93,26 +93,26 @@ async def cleanup_past_posts_periodic():
             logging.getLogger(__name__).exception("Ошибка очистки прошедших постов")
 
 async def generate_daily_random_posts():
-    """Ежедневная генерация новых рандомных постов в 00:00"""
+    """Ежедневная генерация рандомных постов на ТЕКУЩИЙ день в 00:01"""
     while True:
         try:
-            # Ждем до следующего дня в 00:00
+            # Ждем до ближайших 00:01 локального времени
             now = datetime.now()
-            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            today_001 = now.replace(hour=0, minute=1, second=0, microsecond=0)
+            if now >= today_001:
+                target = today_001 + timedelta(days=1)
+            else:
+                target = today_001
+            sleep_s = max(0, (target - now).total_seconds())
+            logging.getLogger(__name__).info(
+                f"Ожидание до {target.strftime('%Y-%m-%d %H:%M:%S')} для планирования рандомных постов: {int(sleep_s)} сек"
+            )
+            await asyncio.sleep(sleep_s)
 
-            # Вычисляем время до следующего дня в 00:00
-            time_until_tomorrow = (tomorrow - now).total_seconds()
-
-            if time_until_tomorrow > 0:
-                logging.getLogger(__name__).info(
-                    f"Ожидание до следующего дня для генерации рандомных постов: {time_until_tomorrow} секунд"
-                )
-                await asyncio.sleep(time_until_tomorrow)
-
-            # Генерируем посты на следующий день
-            logging.getLogger(__name__).info("Запуск ежедневной генерации рандомных постов...")
-            await scheduler.generate_next_day_random_posts()
-            logging.getLogger(__name__).info("Рандомные посты на следующий день сгенерированы")
+            # Генерируем посты на текущий день (после наступления суток)
+            logging.getLogger(__name__).info("Генерация рандомных постов на текущие сутки...")
+            await scheduler.generate_today_random_posts()
+            logging.getLogger(__name__).info("Рандомные посты на текущие сутки сгенерированы")
 
         except Exception:
             logging.getLogger(__name__).exception("Ошибка в generate_daily_random_posts")
@@ -151,9 +151,7 @@ async def main():
     tasks = [
         asyncio.create_task(cleanup_clients()),
         asyncio.create_task(check_license_notifications()),
-        # Убираем отдельный полуночный генератор, т.к. сам планировщик
-        # делает дозаполнение и генерацию слотов, что предотвращает гонки
-        # asyncio.create_task(generate_daily_random_posts()),
+        asyncio.create_task(generate_daily_random_posts()),
         asyncio.create_task(cleanup_past_posts_periodic()),
     ]
 
