@@ -19,28 +19,13 @@ from io import BytesIO
 from typing import Dict, Optional
 
 from config import Config
+from clients import pyrogram_clients
 from database import get_user_db_path, safe_json_loads
 from utils import clean_post_content
 
 logger = logging.getLogger(__name__)
 
-def clean_telegram_links(text):
-    """Удаляет ссылки/упоминания телеграм-каналов из текста, сохраняя исходные абзацы и переносы.
-    - Удаляет t.me/telegram.me ссылки
-    - Удаляет @username как отдельные токены
-    - Не схлопывает пробелы и не меняет переводы строк
-    """
-    if not text:
-        return text
-    
-    # Удаляем ссылки на Telegram каналы/приглашения в любом месте текста
-    text = re.sub(r'(https?://)?t(?:elegram)?\.me/[A-Za-z0-9_+/]+', '', text)
-    
-    # Удаляем @username, но только когда это отдельный токен (не часть email)
-    text = re.sub(r'(?<!\S)@[A-Za-z0-9_]{3,}(?!\S)', '', text)
-    
-    # Возвращаем как есть, чтобы сохранить форматирование/абзацы
-    return text
+# Удалены дублирующие чистилки; используйте clean_post_content из utils
 
 class PostScheduler:
     def __init__(self, bot: Bot):
@@ -48,13 +33,10 @@ class PostScheduler:
         self.running = False
         self.task = None
         self.session_string = Config.get_session_string()
-        # Кэш клиентов Pyrogram по session_string
-        self._client_cache: Dict[str, Client] = {}
+        # Клиенты Pyrogram через общий фабричный кэш
         # Ограничение параллелизма публикаций во избежание FloodWait
         self._publish_semaphore = asyncio.Semaphore(5)
-        # Настройка диапазона джиттера для разнесения публикаций по целям (в секундах)
-        self.random_min_jitter_sec = 60
-        self.random_max_jitter_sec = 300
+        # Поля джиттера удалены: публикация строго по расписанию
         # Троттлинг для периодической дозаписи расписаний
         self._last_backfill_time: Optional[datetime] = None
         # Локи по каналам, чтобы избежать гонок публикаций в один канал
@@ -77,28 +59,10 @@ class PostScheduler:
             return True
         
     async def _get_client(self, session_string: str, name_hint: str) -> Optional[Client]:
-        if not session_string:
-            return None
-        if session_string in self._client_cache:
-            return self._client_cache[session_string]
-        client = Client(
-            name_hint,
-            api_id=Config.API_ID,
-            api_hash=Config.API_HASH,
-            session_string=session_string,
-            in_memory=True
-        )
-        await client.start()
-        self._client_cache[session_string] = client
-        return client
+        return await pyrogram_clients.get_client(session_string, name_hint)
 
     async def _stop_all_clients(self):
-        for client in list(self._client_cache.values()):
-            try:
-                await client.stop()
-            except Exception:
-                pass
-        self._client_cache.clear()
+        await pyrogram_clients.stop_all()
         
     async def start(self):
         """Запуск планировщика"""
@@ -142,7 +106,7 @@ class PostScheduler:
                         self._last_backfill_time = now
                 except Exception:
                     pass
-                await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+                await asyncio.sleep(5)  # Проверяем чаще для точности публикаций
             except Exception as e:
                 logger.error(f"Ошибка в цикле планировщика: {e}")
                 await asyncio.sleep(60)
@@ -169,7 +133,7 @@ class PostScheduler:
                         post_id, channel_id, content_type, content, media_id, scheduled_time = post
                         logger.info(f"Публикация поста {post_id} в {channel_id} (тип={content_type}, время={scheduled_time})")
                         try:
-                            cleaned_content = clean_telegram_links(content) if content else ""
+                            cleaned_content = clean_post_content(content) if content else ""
                             if content_type == "text":
                                 await self.bot.send_message(channel_id, cleaned_content)
                             elif content_type == "photo":
@@ -536,28 +500,28 @@ class PostScheduler:
             }
             if selected_post.text:
                 post_data['type'] = 'text'
-                post_data['text'] = clean_telegram_links(selected_post.text)
+                post_data['text'] = clean_post_content(selected_post.text)
             elif selected_post.photo:
                 post_data['type'] = 'photo'
                 # Скачиваем в память
                 post_data['media'] = await client.download_media(selected_post.photo, in_memory=True)
-                post_data['caption'] = clean_telegram_links(getattr(selected_post, 'caption', None) or "")
+                post_data['caption'] = clean_post_content(getattr(selected_post, 'caption', None) or "")
                 # Иногда текст в соседнем сообщении альбома — попытаемся взять text как caption-фолбэк
                 if not post_data['caption'] and getattr(selected_post, 'media_group_id', None):
                     # Ищем среди собранной группы с тем же media_group_id
                     group_id = str(selected_post.media_group_id)
                     candidate = grouped.get(group_id, {}).get('with_caption')
                     if candidate and getattr(candidate, 'caption', None):
-                        post_data['caption'] = clean_telegram_links(candidate.caption or "")
+                        post_data['caption'] = clean_post_content(candidate.caption or "")
             elif selected_post.video:
                 post_data['type'] = 'video'
                 post_data['media'] = await client.download_media(selected_post.video, in_memory=True)
-                post_data['caption'] = clean_telegram_links(getattr(selected_post, 'caption', None) or "")
+                post_data['caption'] = clean_post_content(getattr(selected_post, 'caption', None) or "")
                 if not post_data['caption'] and getattr(selected_post, 'media_group_id', None):
                     group_id = str(selected_post.media_group_id)
                     candidate = grouped.get(group_id, {}).get('with_caption')
                     if candidate and getattr(candidate, 'caption', None):
-                        post_data['caption'] = clean_telegram_links(candidate.caption or "")
+                        post_data['caption'] = clean_post_content(candidate.caption or "")
             return post_data
         except Exception as e:
             logger.error(f"Ошибка получения поста из донора {donor}: {e}")
@@ -725,7 +689,7 @@ class PostScheduler:
                     try:
                         # Сначала обрабатываем медиа с подписью, затем чистый текст
                         if message.photo:
-                            caption = clean_telegram_links(message.caption or "")
+                            caption = clean_post_content(message.caption or "")
                             # Дедуп резервация
                             try:
                                 fingerprint = self._make_post_fingerprint({"type": "photo", "caption": caption, "text": None})
@@ -759,7 +723,7 @@ class PostScheduler:
                                 except Exception:
                                     pass
                         elif message.video:
-                            caption = clean_telegram_links(message.caption or "")
+                            caption = clean_post_content(message.caption or "")
                             try:
                                 fingerprint = self._make_post_fingerprint({"type": "video", "caption": caption, "text": None})
                                 ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
@@ -792,7 +756,7 @@ class PostScheduler:
                                 except Exception:
                                     pass
                         elif message.document:
-                            caption = clean_telegram_links(message.caption or "")
+                            caption = clean_post_content(message.caption or "")
                             try:
                                 fingerprint = self._make_post_fingerprint({"type": "document", "caption": caption, "text": None})
                                 ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
@@ -826,7 +790,7 @@ class PostScheduler:
                                     pass
                         elif message.audio:
                             try:
-                                fingerprint = self._make_post_fingerprint({"type": "audio", "caption": clean_telegram_links(message.caption or ""), "text": None})
+                                fingerprint = self._make_post_fingerprint({"type": "audio", "caption": clean_post_content(message.caption or ""), "text": None})
                                 ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
                             except Exception:
                                 ok = True
@@ -839,13 +803,13 @@ class PostScheduler:
                                 from io import BytesIO
                                 if isinstance(data_obj, BytesIO):
                                     data = data_obj.getvalue()
-                                    await self.bot.send_audio(target_channel, BufferedInputFile(data, filename="audio.mp3"), caption=clean_telegram_links(message.caption or ""))
+                                    await self.bot.send_audio(target_channel, BufferedInputFile(data, filename="audio.mp3"), caption=clean_post_content(message.caption or ""))
                                 elif isinstance(data_obj, (bytes, bytearray)):
-                                    await self.bot.send_audio(target_channel, BufferedInputFile(data_obj, filename="audio.mp3"), caption=clean_telegram_links(message.caption or ""))
+                                    await self.bot.send_audio(target_channel, BufferedInputFile(data_obj, filename="audio.mp3"), caption=clean_post_content(message.caption or ""))
                                 else:
                                     with open(str(data_obj), 'rb') as f:
                                         data = f.read()
-                                    await self.bot.send_audio(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "audio.mp3"), caption=clean_telegram_links(message.caption or ""))
+                                    await self.bot.send_audio(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "audio.mp3"), caption=clean_post_content(message.caption or ""))
                             except Exception as e:
                                 logger.error(f"Ошибка отправки аудио в {target_channel}: {e}")
                             finally:
@@ -921,7 +885,7 @@ class PostScheduler:
                                 except Exception:
                                     pass
                         elif message.text:
-                            cleaned_text = clean_telegram_links(message.text)
+                            cleaned_text = clean_post_content(message.text)
                             try:
                                 fingerprint = self._make_post_fingerprint({"type": "text", "caption": None, "text": cleaned_text})
                                 ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
