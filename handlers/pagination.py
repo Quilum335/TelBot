@@ -223,9 +223,19 @@ async def display_channels_paginated(callback: types.CallbackQuery, channels: li
     text = f"{title}\n\n"
     for i in range(start_idx, end_idx):
         channel = channels[i]
-        channel_id = channel[0]
-        channel_title = channel[3] if len(channel) > 3 else channel[1]
-        username_raw = channel[2] if len(channel) > 2 else None
+        # Если сортировка по постам, структура другая: id, title, username, today_count, total_count
+        if sort_type == "posts" and len(channel) >= 5:
+            channel_id = channel[0]
+            channel_title = channel[1]
+            username_raw = channel[2]
+            today_count = channel[3]
+            total_count = channel[4]
+        else:
+            channel_id = channel[0]
+            channel_title = channel[3] if len(channel) > 3 else channel[1]
+            username_raw = channel[2] if len(channel) > 2 else None
+            today_count = None
+            total_count = None
         if username_raw:
             tag_part = f"@{username_raw}"
         else:
@@ -233,8 +243,7 @@ async def display_channels_paginated(callback: types.CallbackQuery, channels: li
         channel_title = channel_title or "Без названия"
         text += f"{i + 1}. {channel_title} ({tag_part})\n"
         if sort_type == "posts":
-            post_count = channel[-1] if len(channel) >= 1 else 0
-            text += f"   📝 Запланировано постов: {post_count}\n"
+            text += f"   📝 Сегодня: {today_count or 0} | Всего: {total_count or 0}\n"
 
     text += f"\n📄 Страница {page + 1} из {total_pages + 1} (всего каналов: {len(channels)})"
 
@@ -270,14 +279,29 @@ async def handle_channels_pagination(callback: types.CallbackQuery):
         elif sort_type == "posts":
             query = (
                 """
-                SELECT c.*, COUNT(p.id) as post_count 
-                FROM channels c 
-                LEFT JOIN posts p ON c.channel_id = p.channel_id 
-                GROUP BY c.channel_id 
-                ORDER BY post_count DESC
+                SELECT 
+                  c.channel_id,
+                  c.channel_title,
+                  c.channel_username,
+                  COALESCE(today_cnt.cnt, 0) as today_count,
+                  COALESCE(total_cnt.cnt, 0) as total_count
+                FROM channels c
+                LEFT JOIN (
+                  SELECT channel_id, COUNT(*) as cnt
+                  FROM posts
+                  WHERE is_published = 0 AND date(scheduled_time) = date('now','localtime')
+                  GROUP BY channel_id
+                ) today_cnt ON today_cnt.channel_id = c.channel_id
+                LEFT JOIN (
+                  SELECT channel_id, COUNT(*) as cnt
+                  FROM posts
+                  WHERE is_published = 0
+                  GROUP BY channel_id
+                ) total_cnt ON total_cnt.channel_id = c.channel_id
+                ORDER BY today_count DESC, total_count DESC
                 """
             )
-            title = "📋 Ваши каналы (по количеству постов):"
+            title = "📋 Ваши каналы (по кол-ву постов сегодня):"
         else:
             query = "SELECT * FROM channels"
             title = "📋 Ваши каналы:"

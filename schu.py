@@ -86,9 +86,9 @@ class PostScheduler:
         
     async def scheduler_loop(self):
         """Основной цикл планировщика"""
-        # Первый раз — сразу пытаемся дозаполнить расписания на сегодня/завтра
+        # Первый раз — сразу пытаемся дозаполнить расписания на сегодня
         try:
-            await self.generate_next_day_random_posts()
+            await self.generate_today_random_posts()
             self._last_backfill_time = datetime.now()
         except Exception:
             pass
@@ -98,11 +98,11 @@ class PostScheduler:
                 await self.check_repost_streams()
                 await self.check_random_posts()
                 await self.check_periodic_posts()  # Добавляем проверку периодических постов
-                # Каждые ~15 минут пытаемся дозаполнить слоты (на случай пропуска полуночи или нового потока)
+                # Каждые ~15 минут пытаемся дозаполнить слоты на сегодня (на случай нового потока)
                 try:
                     now = datetime.now()
                     if not self._last_backfill_time or (now - self._last_backfill_time).total_seconds() >= 15 * 60:
-                        await self.generate_next_day_random_posts()
+                        await self.generate_today_random_posts()
                         self._last_backfill_time = now
                 except Exception:
                     pass
@@ -945,7 +945,7 @@ class PostScheduler:
             logger.error(f"Ошибка проверки донора {donor_channel}: {e}")
 
     async def generate_next_day_random_posts(self):
-        """Генерация рандомных постов на следующий день"""
+        """Генерация рандомных постов на следующий день (legacy, не используется)."""
         try:
             if os.path.exists(Config.DB_DIR):
                 for filename in os.listdir(Config.DB_DIR):
@@ -955,8 +955,19 @@ class PostScheduler:
         except Exception as e:
             logger.error(f"Ошибка в generate_next_day_random_posts: {e}")
 
-    async def _generate_next_day_random_posts_for_db(self, db_path):
-        """Поддержка и пополнение рандомных постов для конкретной БД"""
+    async def generate_today_random_posts(self):
+        """Генерация рандомных постов на текущий день для всех БД."""
+        try:
+            if os.path.exists(Config.DB_DIR):
+                for filename in os.listdir(Config.DB_DIR):
+                    if filename.endswith(".db"):
+                        db_path = os.path.join(Config.DB_DIR, filename)
+                        await self._generate_today_random_posts_for_db(db_path)
+        except Exception as e:
+            logger.error(f"Ошибка в generate_today_random_posts: {e}")
+
+    async def _generate_today_random_posts_for_db(self, db_path):
+        """Поддержка и пополнение рандомных постов на сегодня для конкретной БД"""
         try:
             from database import migrate_posts_table_for_random_posts
             await migrate_posts_table_for_random_posts(db_path)
@@ -986,8 +997,6 @@ class PostScheduler:
                     min_future = now + timedelta(minutes=2)
                     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
                     day_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-                    tomorrow_start = today_start + timedelta(days=1)
-                    tomorrow_end = day_end + timedelta(days=1)
 
                     # Для каждого целевого канала наполняем недостающее количество слотов на сегодня и (минимум) на завтра
                     for idx_target, target_channel in enumerate((target_channels if isinstance(target_channels, list) else []), start=1):
@@ -995,6 +1004,15 @@ class PostScheduler:
                         per_target_offset = timedelta(minutes=max(0, idx_target - 1))
                         # Минимальная дистанция между постами в одном канале: 60 сек
                         min_gap_sec = 60
+                        # Удаляем будущие слоты на завтра (если они уже есть), чтобы планировать только на сегодня
+                        try:
+                            await db.execute(
+                                "DELETE FROM posts WHERE random_post_id = ? AND channel_id = ? AND is_published = 0 AND scheduled_time > ?",
+                                (stream_id, target_channel, day_end.isoformat())
+                            )
+                            await db.commit()
+                        except Exception:
+                            pass
                         # Сбор существующих времён на сегодня
                         cur = await db.execute(
                             """
@@ -1051,62 +1069,6 @@ class PostScheduler:
                                     if dt not in existing_today and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_today):
                                         generated.append(dt)
                             # Вставка недостающих
-                            for dt in generated:
-                                await db.execute(
-                                    """
-                                    INSERT INTO posts (
-                                        channel_id, content_type, content, scheduled_time, is_periodic,
-                                        period_hours, is_published, random_post_id, donor_channels_json,
-                                        target_channels_json, post_freshness, phone_number, is_public_channel
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        target_channel,
-                                        'random',
-                                        f'Рандомный пост ({dt.strftime("%d.%m %H:%M")})',
-                                        dt.isoformat(),
-                                        0,
-                                        0,
-                                        0,
-                                        stream_id,
-                                        json.dumps(donor_channels),
-                                        json.dumps(target_channels),
-                                        post_freshness,
-                                        phone_number,
-                                        is_public_channel,
-                                    )
-                                )
-                        # Аналогично — буфер на завтра
-                        cur = await db.execute(
-                            """
-                            SELECT scheduled_time FROM posts
-                            WHERE random_post_id = ? AND channel_id = ? AND is_published = 0
-                              AND scheduled_time >= ? AND scheduled_time <= ?
-                            """,
-                            (stream_id, target_channel, tomorrow_start.isoformat(), tomorrow_end.isoformat())
-                        )
-                        existing_tomorrow_rows = await cur.fetchall()
-                        existing_tomorrow = set()
-                        for r in existing_tomorrow_rows:
-                            try:
-                                existing_tomorrow.add(datetime.fromisoformat(str(r[0])))
-                            except Exception:
-                                continue
-                        need_tomorrow = max(0, int(posts_per_day) - len(existing_tomorrow))
-                        if need_tomorrow > 0:
-                            generated: list[datetime] = []
-                            if need_tomorrow <= 1440:
-                                picked = sorted(random.sample(range(1440), need_tomorrow))
-                                for m in picked:
-                                    dt = tomorrow_start + timedelta(minutes=m, seconds=random.randint(0, 10)) + per_target_offset
-                                    if dt not in existing_tomorrow and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_tomorrow):
-                                        generated.append(dt)
-                            else:
-                                step = 1440 / need_tomorrow
-                                for i in range(need_tomorrow):
-                                    dt = tomorrow_start + timedelta(minutes=int(i * step), seconds=random.randint(0, 10)) + per_target_offset
-                                    if dt not in existing_tomorrow and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_tomorrow):
-                                        generated.append(dt)
                             for dt in generated:
                                 await db.execute(
                                     """
