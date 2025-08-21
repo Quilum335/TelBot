@@ -398,6 +398,9 @@ def register_handlers(dp, bot):
     dp.callback_query.register(post_action, F.data.startswith("post_action_"))
     dp.callback_query.register(delete_post, F.data.startswith("delete_post_"))
     dp.callback_query.register(confirm_delete, F.data.startswith("confirm_delete_"))
+
+    # Самый последний: обработчик любого текста -> главное меню
+    dp.message.register(fallback_to_menu, F.text)
     dp.callback_query.register(change_donor, F.data.startswith("change_donor_"))
     dp.message.register(process_new_donor, ScheduledPostsStates.waiting_for_new_donor)
     
@@ -612,6 +615,17 @@ async def cmd_menu(message: types.Message):
         "📋 Главное меню",
         reply_markup=get_main_menu_keyboard(user_info)
     )
+
+# Catch-all text handler: open main menu for any unrelated text
+async def fallback_to_menu(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    has_access, error_message = await check_user_access(user_id, username)
+    if not has_access:
+        await message.answer(error_message)
+        return
+    user_info = await get_user_info(user_id, username)
+    await message.answer("📋 Главное меню", reply_markup=get_main_menu_keyboard(user_info))
 
 async def cmd_admin(message: types.Message, state: FSMContext):
     """Обработка команды /admin54"""
@@ -2262,7 +2276,17 @@ async def show_random_post_details(callback: types.CallbackQuery):
         """, (post_id,))
         row = await cursor.fetchone()
     if not row:
-        await callback.answer("Не найден поток", show_alert=True)
+        # Поток могли удалить/деактивировать — перерисуем список вместо алерта
+        data = await get_scheduled_posts(user_id, username)
+        await _display_scheduled_posts_paginated(
+            callback,
+            data.get('old_random_posts', []),
+            page=0,
+            items_per_page=5,
+            title="🎲 Ваши рандомные публикации:",
+            back_callback="scheduled_posts",
+            post_type="random_stream_config",
+        )
         return
     donors_json, targets_json, ppd, freshness = row
     donors = safe_json_loads(donors_json, [])
@@ -2388,7 +2412,16 @@ async def paginate_random_times(callback: types.CallbackQuery):
         cursor = await db.execute("SELECT next_post_times_json, donor_channels, target_channels, posts_per_day, post_freshness FROM random_posts WHERE id = ?", (stream_id,))
         row = await cursor.fetchone()
     if not row:
-        await callback.answer("Не найден поток", show_alert=True)
+        data = await get_scheduled_posts(user_id, username)
+        await _display_scheduled_posts_paginated(
+            callback,
+            data.get('old_random_posts', []),
+            page=0,
+            items_per_page=5,
+            title="🎲 Ваши рандомные публикации:",
+            back_callback="scheduled_posts",
+            post_type="random_stream_config",
+        )
         return
     times_json, donors_json, targets_json, ppd, freshness = row
     all_times_raw = safe_json_loads(times_json, []) or []

@@ -579,6 +579,29 @@ class PostScheduler:
     async def check_repost_streams(self):
         """Проверка потоков репостов"""
         if not self.session_string:
+            # Попробуем взять первую доступную сессию из любой БД linked_accounts и сохранить как основную
+            try:
+                if os.path.exists(Config.DB_DIR):
+                    for filename in os.listdir(Config.DB_DIR):
+                        if not filename.endswith('.db'):
+                            continue
+                        db_path = os.path.join(Config.DB_DIR, filename)
+                        async with aiosqlite.connect(db_path) as db:
+                            cur = await db.execute("SELECT session_string FROM linked_accounts ORDER BY id ASC LIMIT 1")
+                            row = await cur.fetchone()
+                            if row and row[0]:
+                                self.session_string = row[0]
+                                # Persist to main session file
+                                try:
+                                    os.makedirs(Config.SESSIONS_DIR, exist_ok=True)
+                                    with open(os.path.join(Config.SESSIONS_DIR, 'session_string.txt'), 'w') as f:
+                                        f.write(self.session_string)
+                                except Exception:
+                                    pass
+                                break
+            except Exception:
+                pass
+        if not self.session_string:
             logger.warning("Нет основной сессии для проверки репостов")
             return
             
@@ -970,6 +993,8 @@ class PostScheduler:
                     for idx_target, target_channel in enumerate((target_channels if isinstance(target_channels, list) else []), start=1):
                         # Перенос по минутам для отличия расписаний между целями: 0, +1, +2, ... минуты
                         per_target_offset = timedelta(minutes=max(0, idx_target - 1))
+                        # Минимальная дистанция между постами в одном канале: 60 сек
+                        min_gap_sec = 60
                         # Сбор существующих времён на сегодня
                         cur = await db.execute(
                             """
@@ -1002,7 +1027,7 @@ class PostScheduler:
                             if need_today <= remaining_minutes:
                                 picked = sorted(random.sample(range(remaining_minutes), need_today))
                                 for m in picked:
-                                    dt = now + timedelta(minutes=m, seconds=random.randint(0, 59)) + per_target_offset
+                                    dt = now + timedelta(minutes=m, seconds=random.randint(0, 10)) + per_target_offset
                                     # если попали в последнюю минуту суток, сдвигаем на завтра + небольшой джиттер
                                     if dt.hour == 23 and dt.minute == 59:
                                         dt = tomorrow_start + timedelta(minutes=random.randint(0, 10)) + per_target_offset
@@ -1010,19 +1035,20 @@ class PostScheduler:
                                         dt = min_future
                                     if dt > day_end:
                                         dt = day_end
-                                    if dt not in existing_today:
+                                    # Обеспечим минимальный разрыв с уже существующими
+                                    if dt not in existing_today and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_today):
                                         generated.append(dt)
                             else:
                                 step = remaining_minutes / need_today
                                 for i in range(need_today):
-                                    dt = now + timedelta(minutes=int(i * step), seconds=random.randint(0, 59)) + per_target_offset
+                                    dt = now + timedelta(minutes=int(i * step), seconds=random.randint(0, 10)) + per_target_offset
                                     if dt.hour == 23 and dt.minute == 59:
                                         dt = tomorrow_start + timedelta(minutes=random.randint(0, 10)) + per_target_offset
                                     if dt < min_future:
                                         dt = min_future
                                     if dt > day_end:
                                         dt = day_end
-                                    if dt not in existing_today:
+                                    if dt not in existing_today and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_today):
                                         generated.append(dt)
                             # Вставка недостающих
                             for dt in generated:
@@ -1072,14 +1098,14 @@ class PostScheduler:
                             if need_tomorrow <= 1440:
                                 picked = sorted(random.sample(range(1440), need_tomorrow))
                                 for m in picked:
-                                    dt = tomorrow_start + timedelta(minutes=m, seconds=random.randint(0, 59)) + per_target_offset
-                                    if dt not in existing_tomorrow:
+                                    dt = tomorrow_start + timedelta(minutes=m, seconds=random.randint(0, 10)) + per_target_offset
+                                    if dt not in existing_tomorrow and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_tomorrow):
                                         generated.append(dt)
                             else:
                                 step = 1440 / need_tomorrow
                                 for i in range(need_tomorrow):
-                                    dt = tomorrow_start + timedelta(minutes=int(i * step), seconds=random.randint(0, 59)) + per_target_offset
-                                    if dt not in existing_tomorrow:
+                                    dt = tomorrow_start + timedelta(minutes=int(i * step), seconds=random.randint(0, 10)) + per_target_offset
+                                    if dt not in existing_tomorrow and all(abs((dt - ex).total_seconds()) >= min_gap_sec for ex in existing_tomorrow):
                                         generated.append(dt)
                             for dt in generated:
                                 await db.execute(
