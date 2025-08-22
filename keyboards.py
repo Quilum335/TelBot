@@ -453,7 +453,7 @@ def get_donor_count_keyboard():
         InlineKeyboardButton(text="Один донор", callback_data="donor_count_one"),
         InlineKeyboardButton(text="Несколько доноров", callback_data="donor_count_many"),
     )
-    keyboard.row(InlineKeyboardButton(text="◀️ Назад", callback_data="auto_random"))
+    keyboard.row(InlineKeyboardButton(text="◀️ Назад", callback_data="post_auto"))
     return keyboard.as_markup()
 
 def get_periodic_donor_count_keyboard():
@@ -463,7 +463,7 @@ def get_periodic_donor_count_keyboard():
         InlineKeyboardButton(text="Один донор", callback_data="periodic_count_one"),
         InlineKeyboardButton(text="Несколько доноров", callback_data="periodic_count_many"),
     )
-    keyboard.row(InlineKeyboardButton(text="◀️ Назад", callback_data="auto_periodic"))
+    keyboard.row(InlineKeyboardButton(text="◀️ Назад", callback_data="post_auto"))
     return keyboard.as_markup()
 
 def get_donors_confirm_keyboard(done_callback: str, back_callback: str):
