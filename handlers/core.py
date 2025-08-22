@@ -1246,21 +1246,17 @@ async def show_stream_details(callback: types.CallbackQuery, state: FSMContext):
         text += f"ℹ️ {mode_description}\n\n"
         text += f"📡 Донор: {donor_channel}\n"
         text += f"📊 Целевые каналы ({len(target_names)}):\n"
-        
         for i, name in enumerate(target_names, 1):
-            text += f"  {i}. {name}\n"
-        
+            if name.startswith("@"):
+                text += f"  {i}. <a href='https://t.me/{name.lstrip('@')}'>{name}</a>\n"
+            else:
+                text += f"  {i}. {name}\n"
         text += f"🌐 Тип донора: {'Публичный канал' if is_public_channel else 'Привязанный канал'}\n"
 
-        
-        if last_message_id:
-            text += f"📝 Последний пост: {last_message_id}\n"
-        
-        from keyboards import get_post_action_keyboard
-        await callback.message.edit_text(
-            text,
-            reply_markup=get_post_action_keyboard(stream_id, 'repost_stream')
-        )
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_post_action_keyboard(stream_id, 'repost_stream')
+    )
 
 async def admin_users_management(callback: types.CallbackQuery):
     # Simplified admin management menu (kept for compatibility)
