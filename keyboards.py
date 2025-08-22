@@ -308,7 +308,6 @@ def get_channel_name_method_keyboard():
     """Клавиатура для выбора метода создания названия канала"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎲 Сгенерировать случайное", callback_data="channel_generate_one")],
-        [InlineKeyboardButton(text="🎲 Сгенерировать несколько", callback_data="channel_generate_many")],
         [InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="channel_name_input")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="create_channel_start")]
     ])

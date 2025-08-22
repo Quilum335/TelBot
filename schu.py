@@ -966,170 +966,166 @@ class PostScheduler:
                     tomorrow_start = today_start + timedelta(days=1)
                     tomorrow_end = day_end + timedelta(days=1)
 
-                    # Для каждого целевого канала наполняем недостающее количество слотов на сегодня и (минимум) на завтра
-                    for idx_target, target_channel in enumerate((target_channels if isinstance(target_channels, list) else []), start=1):
-                        # Перенос по минутам для отличия расписаний между целями: 0, +1, +2, ... минуты
-                        per_target_offset = timedelta(minutes=max(0, idx_target - 1))
-                        # Сбор существующих времён на сегодня
-                        cur = await db.execute(
-                            """
-                            SELECT scheduled_time FROM posts
-                            WHERE random_post_id = ? AND channel_id = ? AND is_published = 0
-                              AND scheduled_time >= ? AND scheduled_time <= ?
-                            """,
-                            (stream_id, target_channel, today_start.isoformat(), day_end.isoformat())
-                        )
-                        existing_today_rows = await cur.fetchall()
-                        existing_today = set()
-                        for r in existing_today_rows:
-                            try:
-                                existing_today.add(datetime.fromisoformat(str(r[0])))
-                            except Exception:
-                                continue
-                        # `posts_per_day` в random_posts хранится как количество
-                        # постов В ДЕНЬ НА КАЖДУЮ ЦЕЛЬ (per-target)
-                        try:
-                            per_target_posts = int(posts_per_day)
-                        except Exception:
-                            per_target_posts = 0
-                        need_today = max(0, int(per_target_posts) - len(existing_today))
-
-                        # Генерация недостающих слотов на сегодня
-                        if need_today > 0:
-                            remaining_seconds_total = max(0, (day_end - now).total_seconds())
-                            remaining_minutes = max(1, int(remaining_seconds_total // 60))
-                            generated: list[datetime] = []
-                            if need_today <= remaining_minutes:
-                                picked = sorted(random.sample(range(remaining_minutes), need_today))
-                                for m in picked:
-                                    dt = now + timedelta(minutes=m, seconds=random.randint(0, 59)) + per_target_offset
-                                    # если попали в последнюю минуту суток, сдвигаем на завтра + небольшой джиттер
-                                    if dt.hour == 23 and dt.minute == 59:
-                                        dt = tomorrow_start + timedelta(minutes=random.randint(0, 10)) + per_target_offset
-                                    if dt < min_future:
-                                        dt = min_future
-                                    if dt > day_end:
-                                        dt = day_end
-                                    if dt not in existing_today:
-                                        generated.append(dt)
-                            else:
-                                step = remaining_minutes / need_today
-                                for i in range(need_today):
-                                    dt = now + timedelta(minutes=int(i * step), seconds=random.randint(0, 59)) + per_target_offset
-                                    if dt.hour == 23 and dt.minute == 59:
-                                        dt = tomorrow_start + timedelta(minutes=random.randint(0, 10)) + per_target_offset
-                                    if dt < min_future:
-                                        dt = min_future
-                                    if dt > day_end:
-                                        dt = day_end
-                                    if dt not in existing_today:
-                                        generated.append(dt)
-                            # Вставка недостающих
-                            for dt in generated:
-                                await db.execute(
-                                    """
-                                    INSERT INTO posts (
-                                        channel_id, content_type, content, scheduled_time, is_periodic,
-                                        period_hours, is_published, random_post_id, donor_channels_json,
-                                        target_channels_json, post_freshness, phone_number, is_public_channel
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        target_channel,
-                                        'random',
-                                        f'Рандомный пост ({dt.strftime("%d.%m %H:%M")})',
-                                        dt.isoformat(),
-                                        0,
-                                        0,
-                                        0,
-                                        stream_id,
-                                        json.dumps(donor_channels),
-                                        json.dumps(target_channels),
-                                        post_freshness,
-                                        phone_number,
-                                        is_public_channel,
-                                    )
-                                )
-                        # Аналогично — буфер на завтра
-                        cur = await db.execute(
-                            """
-                            SELECT scheduled_time FROM posts
-                            WHERE random_post_id = ? AND channel_id = ? AND is_published = 0
-                              AND scheduled_time >= ? AND scheduled_time <= ?
-                            """,
-                            (stream_id, target_channel, tomorrow_start.isoformat(), tomorrow_end.isoformat())
-                        )
-                        existing_tomorrow_rows = await cur.fetchall()
-                        existing_tomorrow = set()
-                        for r in existing_tomorrow_rows:
-                            try:
-                                existing_tomorrow.add(datetime.fromisoformat(str(r[0])))
-                            except Exception:
-                                continue
-                        need_tomorrow = max(0, int(posts_per_day) - len(existing_tomorrow))
-                        if need_tomorrow > 0:
-                            generated: list[datetime] = []
-                            if need_tomorrow <= 1440:
-                                picked = sorted(random.sample(range(1440), need_tomorrow))
-                                for m in picked:
-                                    dt = tomorrow_start + timedelta(minutes=m, seconds=random.randint(0, 59)) + per_target_offset
-                                    if dt not in existing_tomorrow:
-                                        generated.append(dt)
-                            else:
-                                step = 1440 / need_tomorrow
-                                for i in range(need_tomorrow):
-                                    dt = tomorrow_start + timedelta(minutes=int(i * step), seconds=random.randint(0, 59)) + per_target_offset
-                                    if dt not in existing_tomorrow:
-                                        generated.append(dt)
-                            for dt in generated:
-                                await db.execute(
-                                    """
-                                    INSERT INTO posts (
-                                        channel_id, content_type, content, scheduled_time, is_periodic,
-                                        period_hours, is_published, random_post_id, donor_channels_json,
-                                        target_channels_json, post_freshness, phone_number, is_public_channel
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        target_channel,
-                                        'random',
-                                        f'Рандомный пост ({dt.strftime("%d.%m %H:%M")})',
-                                        dt.isoformat(),
-                                        0,
-                                        0,
-                                        0,
-                                        stream_id,
-                                        json.dumps(donor_channels),
-                                        json.dumps(target_channels),
-                                        post_freshness,
-                                        phone_number,
-                                        is_public_channel,
-                                    )
-                                )
-
-                    # Обновляем сводный список времён потока как объединение будущих времён из posts
+                    # --- Новый алгоритм: общее количество постов на день для всего потока ---
+                    # Сбор существующих времён на сегодня (для всех целевых каналов)
                     cur = await db.execute(
                         """
                         SELECT scheduled_time FROM posts
-                        WHERE random_post_id = ? AND is_published = 0 AND scheduled_time > datetime('now','localtime')
-                        ORDER BY scheduled_time ASC
+                        WHERE random_post_id = ? AND is_published = 0
+                          AND scheduled_time >= ? AND scheduled_time <= ?
                         """,
-                        (stream_id,)
+                        (stream_id, today_start.isoformat(), day_end.isoformat())
                     )
-                    union_rows = await cur.fetchall()
-                    union_times = []
-                    for r in union_rows:
+                    existing_today_rows = await cur.fetchall()
+                    existing_today = set()
+                    for r in existing_today_rows:
                         try:
-                            union_times.append(datetime.fromisoformat(str(r[0])))
+                            existing_today.add(datetime.fromisoformat(str(r[0])))
                         except Exception:
                             continue
-                    await db.execute(
-                        "UPDATE random_posts SET next_post_times_json = ? WHERE id = ?",
-                        (json.dumps([t.isoformat() for t in union_times]), stream_id)
-                    )
+                    try:
+                        total_posts_per_day = int(posts_per_day)
+                    except Exception:
+                        total_posts_per_day = 0
+                    need_today = max(0, total_posts_per_day - len(existing_today))
 
-                    await db.commit()
-                    logger.info(f"Дополнены рандомные посты для потока {stream_id}: цели={len(target_channels)} по {posts_per_day}/день")
+                    # Генерация недостающих слотов на сегодня
+                    if need_today > 0:
+                        remaining_seconds_total = max(0, (day_end - now).total_seconds())
+                        remaining_minutes = max(1, int(remaining_seconds_total // 60))
+                        generated: list[tuple[datetime, int]] = []  # (time, target_channel)
+                        if need_today <= remaining_minutes:
+                            picked = sorted(random.sample(range(remaining_minutes), need_today))
+                            for m in picked:
+                                dt = now + timedelta(minutes=m, seconds=random.randint(0, 59))
+                                # если попали в последнюю минуту суток, сдвигаем на завтра + небольшой джиттер
+                                if dt.hour == 23 and dt.minute == 59:
+                                    dt = tomorrow_start + timedelta(minutes=random.randint(0, 10))
+                                if dt < min_future:
+                                    dt = min_future
+                                if dt > day_end:
+                                    dt = day_end
+                                if dt not in existing_today:
+                                    generated.append((dt, random.choice(target_channels)))
+                        else:
+                            step = remaining_minutes / need_today
+                            for i in range(need_today):
+                                dt = now + timedelta(minutes=int(i * step), seconds=random.randint(0, 59))
+                                if dt.hour == 23 and dt.minute == 59:
+                                    dt = tomorrow_start + timedelta(minutes=random.randint(0, 10))
+                                if dt < min_future:
+                                    dt = min_future
+                                if dt > day_end:
+                                    dt = day_end
+                                if dt not in existing_today:
+                                    generated.append((dt, random.choice(target_channels)))
+                        # Вставка недостающих слотов
+                        for dt, target_channel in generated:
+                            await db.execute(
+                                """
+                                INSERT INTO posts (
+                                    channel_id, content_type, content, scheduled_time, is_periodic,
+                                    period_hours, is_published, random_post_id, donor_channels_json,
+                                    target_channels_json, post_freshness, phone_number, is_public_channel
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    target_channel,
+                                    'random',
+                                    f'Рандомный пост ({dt.strftime("%d.%m %H:%M")})',
+                                    dt.isoformat(),
+                                    0,
+                                    0,
+                                    0,
+                                    stream_id,
+                                    json.dumps(donor_channels),
+                                    json.dumps(target_channels),
+                                    post_freshness,
+                                    phone_number,
+                                    is_public_channel,
+                                )
+                            )
+
+                    # ---- Буфер слотов на завтра ----
+                    cur = await db.execute(
+                        """
+                        SELECT scheduled_time FROM posts
+                        WHERE random_post_id = ? AND is_published = 0
+                          AND scheduled_time >= ? AND scheduled_time <= ?
+                        """,
+                        (stream_id, tomorrow_start.isoformat(), tomorrow_end.isoformat())
+                    )
+                    existing_tomorrow_rows = await cur.fetchall()
+                    existing_tomorrow = set()
+                    for r in existing_tomorrow_rows:
+                        try:
+                            existing_tomorrow.add(datetime.fromisoformat(str(r[0])))
+                        except Exception:
+                            continue
+                    need_tomorrow = max(0, total_posts_per_day - len(existing_tomorrow))
+                    if need_tomorrow > 0:
+                        generated: list[tuple[datetime, int]] = []
+                        if need_tomorrow <= 1440:
+                            picked = sorted(random.sample(range(1440), need_tomorrow))
+                            for m in picked:
+                                dt = tomorrow_start + timedelta(minutes=m, seconds=random.randint(0, 59))
+                                if dt not in existing_tomorrow:
+                                    generated.append((dt, random.choice(target_channels)))
+                        else:
+                            step = 1440 / need_tomorrow
+                            for i in range(need_tomorrow):
+                                dt = tomorrow_start + timedelta(minutes=int(i * step), seconds=random.randint(0, 59))
+                                if dt not in existing_tomorrow:
+                                    generated.append((dt, random.choice(target_channels)))
+                        for dt, target_channel in generated:
+                            await db.execute(
+                                """
+                                INSERT INTO posts (
+                                    channel_id, content_type, content, scheduled_time, is_periodic,
+                                    period_hours, is_published, random_post_id, donor_channels_json,
+                                    target_channels_json, post_freshness, phone_number, is_public_channel
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    target_channel,
+                                    'random',
+                                    f'Рандомный пост ({dt.strftime("%d.%m %H:%M")})',
+                                    dt.isoformat(),
+                                    0,
+                                    0,
+                                    0,
+                                    stream_id,
+                                    json.dumps(donor_channels),
+                                    json.dumps(target_channels),
+                                    post_freshness,
+                                    phone_number,
+                                    is_public_channel,
+                                )
+                            )
+
+                # Обновляем сводный список времён потока как объединение будущих времён из posts
+                cur = await db.execute(
+                    """
+                    SELECT scheduled_time FROM posts
+                    WHERE random_post_id = ? AND is_published = 0 AND scheduled_time > datetime('now','localtime')
+                    ORDER BY scheduled_time ASC
+                    """,
+                    (stream_id,)
+                )
+                union_rows = await cur.fetchall()
+                union_times = []
+                for r in union_rows:
+                    try:
+                        union_times.append(datetime.fromisoformat(str(r[0])))
+                    except Exception:
+                        continue
+                await db.execute(
+                    "UPDATE random_posts SET next_post_times_json = ? WHERE id = ?",
+                    (json.dumps([t.isoformat() for t in union_times]), stream_id)
+                )
+
+                await db.commit()
+                logger.info(f"Дополнены рандомные посты для потока {stream_id}: цели={len(target_channels)} по {posts_per_day}/день")
         
         except Exception as e:
             logger.error(f"Ошибка в _generate_next_day_random_posts_for_db для {db_path}: {e}")
