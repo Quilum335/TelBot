@@ -295,6 +295,7 @@ def register_handlers(dp, bot):
     
     # Получение выбранного канала через request_chat
     dp.message.register(on_chat_shared, F.chat_shared)
+    dp.message.register(cancel_link_channel, F.text == "Отмена")
     
     # Обработчики callback
     dp.callback_query.register(back_to_menu, F.data == "back_to_menu")
@@ -569,7 +570,7 @@ async def on_chat_shared(message: types.Message):
                 (channel_username, channel_title, channel_id)
             )
         await db.commit()
-    await message.answer("✅ Канал привязан! Откройте '📋 Список каналов' для проверки.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅ Канал привязан! Вы можете привязать ещё один канал или нажмите Отмена для выхода.")
 
 # Обработчики команд
 async def cmd_start(message: types.Message):
@@ -928,29 +929,35 @@ async def process_public_channel_input(message: types.Message, state: FSMContext
     if not channel:
         await message.answer("❌ Введите @username или ссылку на канал")
         return
-    # Нормализуем username/ссылку
-    if channel.startswith("http"):
-        try:
-            username = channel.split("/")[-1]
-            # Отрежем параметры типа ?start=... и фрагменты
-            username = username.split("?")[0].split("#")[0]
-            if not username.startswith("@"):
-                channel = f"@{username}"
-            else:
-                channel = username
-        except Exception:
-            pass
-    elif not channel.startswith("@") and not channel.lstrip("-").isdigit():
-        channel = f"@{channel}"
-    # Убираем дубли @ и лишние части, берём последний сегмент
-    if "@" in channel[1:]:
-        channel = "@" + channel.split("@")[-1]
-    # Финальная чистка допустимых символов username
-    m = re.search(r"@([A-Za-z0-9_]{3,})", channel)
-    if m:
-        channel = f"@{m.group(1)}"
- 
-    await state.update_data(public_channel=channel)
+    # Поддержка нескольких доноров через запятую
+    raw_items = [seg.strip() for seg in channel.split(',') if seg.strip()]
+    normalized: list[str] = []
+    for item in raw_items:
+        s = item
+        if s.startswith("http"):
+            try:
+                username = s.split("/")[-1]
+                username = username.split("?")[0].split("#")[0]
+                if not username.startswith("@"):
+                    s = f"@{username}"
+                else:
+                    s = username
+            except Exception:
+                pass
+        elif not s.startswith("@") and not s.lstrip("-").isdigit():
+            s = f"@{s}"
+        if "@" in s[1:]:
+            s = "@" + s.split("@")[-1]
+        m = re.search(r"@([A-Za-z0-9_]{3,})", s)
+        if m:
+            s = f"@{m.group(1)}"
+        normalized.append(s)
+
+    # Если введено несколько — сохраняем списком, иначе одиночный донор
+    if len(normalized) > 1:
+        await state.update_data(public_channel_list=normalized, public_channel=None)
+    else:
+        await state.update_data(public_channel=normalized[0] if normalized else channel, public_channel_list=None)
 
     data = await state.get_data()
     repost_mode = data.get("repost_mode")
@@ -2853,50 +2860,8 @@ async def create_random_stream_from_state(callback: types.CallbackQuery, state: 
             await send_error_message(callback, "Добавьте хотя бы один аккаунт в разделе 'Управлять привязкой'", back_callback="back_to_menu")
             return
 
-    now = datetime.now()
-    
-    # Распределяем посты на оставшееся время СЕГОДНЯ (до 23:59:59)
-    day_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-    times: list[str] = []
-    remaining_seconds_total = (day_end - now).total_seconds()
-    if remaining_seconds_total <= 0:
-        # На всякий случай: если день уже закончился, сдвинем на ближайшие минуты вперед
-        remaining_seconds_total = 60
-        day_end = now + timedelta(seconds=remaining_seconds_total)
-
-    remaining_minutes = max(1, int(remaining_seconds_total // 60))
-
-    # Минимальная отсечка, чтобы исключить около-прошедшие слоты
-    min_future = now + timedelta(minutes=2)
-
-    generated_datetimes: list[datetime] = []
-    if posts_per_day <= remaining_minutes:
-        picked_minutes = sorted(random.sample(range(remaining_minutes), posts_per_day))
-        for m in picked_minutes:
-            dt = now + timedelta(minutes=m, seconds=random.randint(0, 59))
-            if dt < min_future:
-                dt = min_future
-            if dt > day_end:
-                dt = day_end
-            if dt > now and dt <= day_end:
-                generated_datetimes.append(dt)
-    else:
-        # Постов больше, чем минут осталось — распределяем равномерно по минутам
-        step = remaining_minutes / posts_per_day if posts_per_day > 0 else 1
-        for i in range(posts_per_day):
-            offset_minutes = int(i * step)
-            dt = now + timedelta(minutes=offset_minutes, seconds=random.randint(0, 59))
-            if dt < min_future:
-                dt = min_future
-            if dt > day_end:
-                dt = day_end
-            generated_datetimes.append(dt)
-
-    # Сортируем и нормализуем к ISO
-    generated_datetimes = sorted(generated_datetimes)
-    # Для каждой цели генерируем отдельное расписание (случайное).
-    # Важно: `posts_per_day` в UI трактуется как общее количество постов в день
-    # для всего потока, поэтому распределяем его по целям
+    # Создаём запись потока без немедленной вставки per-target постов,
+    # дальнейшее расписание создаст планировщик (generate_next_day_random_posts)
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute(
             """
@@ -2907,77 +2872,10 @@ async def create_random_stream_from_state(callback: types.CallbackQuery, state: 
             """,
             (
                 json.dumps(donors), json.dumps(targets), posts_per_day, freshness,
-                phone_number, 1 if is_public else 0, json.dumps([]) # will fill below
+                phone_number, 1 if is_public else 0, json.dumps([])
             )
         )
         stream_id = cursor.lastrowid
-        union_times = []
-        # Генерируем индивидуальные времена для каждой цели
-        all_targets = targets if isinstance(targets, list) else []
-        # Интерпретируем `posts_per_day` как количество постов В ДЕНЬ НА КАЖДУЮ ЦЕЛЬ
-        for idx_target, target_channel in enumerate((all_targets if isinstance(all_targets, list) else []), start=0):
-            # Генерируем список времён для этой цели
-            target_generated: list[datetime] = []
-            per_target_posts = int(posts_per_day)
-            if per_target_posts <= remaining_minutes:
-                picked_minutes = sorted(random.sample(range(remaining_minutes), per_target_posts))
-                for m in picked_minutes:
-                    dt = now + timedelta(minutes=m, seconds=random.randint(0, 59))
-                    if dt < min_future:
-                        dt = min_future
-                    if dt > day_end:
-                        dt = day_end
-                    if dt > now and dt <= day_end:
-                        target_generated.append(dt)
-            else:
-                step = remaining_minutes / per_target_posts if per_target_posts > 0 else 1
-                for i in range(per_target_posts):
-                    offset_minutes = int(i * step)
-                    dt = now + timedelta(minutes=offset_minutes, seconds=random.randint(0, 59))
-                    if dt < min_future:
-                        dt = min_future
-                    if dt > day_end:
-                        dt = day_end
-                    target_generated.append(dt)
-            target_generated = sorted(target_generated)
-            # Вставим эти времена в posts
-            for dt in target_generated:
-                try:
-                    await db.execute(
-                        """
-                        INSERT INTO posts (
-                            channel_id, content_type, content, scheduled_time, is_periodic,
-                            period_hours, is_published, random_post_id, donor_channels_json,
-                            target_channels_json, post_freshness, phone_number, is_public_channel
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            target_channel,
-                            'random',
-                            f'Рандомный пост ({dt.strftime("%d.%m %H:%M")})',
-                            dt.isoformat(),
-                            0,
-                            0,
-                            0,
-                            stream_id,
-                            json.dumps(donors),
-                            json.dumps(targets),
-                            freshness,
-                            phone_number,
-                            1 if is_public else 0,
-                        )
-                    )
-                    union_times.append(dt)
-                except Exception:
-                    continue
-        # Обновим next_post_times_json как объединение будущих времён
-        try:
-            await db.execute(
-                "UPDATE random_posts SET next_post_times_json = ? WHERE id = ?",
-                (json.dumps([t.isoformat() for t in sorted(union_times)]), stream_id)
-            )
-        except Exception:
-            pass
         await db.commit()
 
     await state.clear()
@@ -3266,3 +3164,14 @@ async def periodic_count_one(callback: types.CallbackQuery, state: FSMContext):
 async def periodic_count_many(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(periodic_allow_multiple=True)
     await callback.message.edit_text("🔁 Источник для потока репостов:", reply_markup=get_periodic_source_keyboard())
+
+aSYNC_CANCEL_TOKEN = "Отмена"
+
+async def cancel_link_channel(message: types.Message):
+    if (message.text or "").strip() != aSYNC_CANCEL_TOKEN:
+        return
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    user_info = await get_user_info(user_id, username)
+    await message.answer("📋 Главное меню", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Что дальше?", reply_markup=get_main_menu_keyboard(user_info))
