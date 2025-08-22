@@ -2972,7 +2972,20 @@ async def create_repost_stream_from_state(callback: types.CallbackQuery, state: 
     
     db_path = await get_user_db_path(user_id, username)
     async with aiosqlite.connect(db_path) as db:
-        if donor_list and isinstance(donor_list, list):
+        if donor_list and isinstance(donor_list, list) and repost_mode == 'random':
+            # Один поток с несколькими донорами (JSON в donor_channel)
+            donors_json = json.dumps(donor_list)
+            await db.execute(
+                """
+                INSERT INTO repost_streams (
+                    donor_channel, target_channels, last_message_id, phone_number,
+                    is_public_channel, post_freshness, is_active, repost_mode
+                ) VALUES (?, ?, 0, ?, 1, 0, 1, ?)
+                """,
+                (donors_json, json.dumps(targets), "", repost_mode)
+            )
+        elif donor_list and isinstance(donor_list, list):
+            # Онлайн режим — создаём отдельный поток на каждого донора (как раньше)
             for donor in donor_list:
                 await db.execute(
                     """
@@ -2998,13 +3011,18 @@ async def create_repost_stream_from_state(callback: types.CallbackQuery, state: 
     await state.clear()
     
     # Показываем детали созданного потока
-    donor_display = donor_channel or f"{len(donor_list)} каналов" if donor_list else "Неизвестно"
+    donor_display = None
+    if donor_list and isinstance(donor_list, list):
+        donor_display = "\n".join([str(d) for d in donor_list]) if repost_mode == 'random' else (donor_list[0] if donor_list else "Неизвестно")
+    else:
+        donor_display = donor_channel or "Неизвестно"
+    
     success_text = (
         f"✅ Поток репостов создан!\n\n"
         f"🎯 Режим: {mode_text}\n"
-        f"📡 Донор: {donor_display}\n"
-        f"📥 Целевые каналы: {len(targets)}\n"
-        f"ℹ️ {mode_description}"
+        f"ℹ️ {mode_description}\n\n"
+        + ("📡 Доноры:\n" + donor_display + "\n" if repost_mode == 'random' and donor_list else f"📡 Донор: {donor_display}\n")
+        + f"📥 Целевые каналы: {len(targets)}\n"
     )
     
     await callback.message.edit_text(

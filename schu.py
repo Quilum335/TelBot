@@ -590,7 +590,7 @@ class PostScheduler:
                 async with aiosqlite.connect(db_file) as db:
                     cursor = await db.execute('''
                         SELECT id, donor_channel, target_channels, last_message_id, 
-                               is_public_channel, phone_number, post_freshness
+                               is_public_channel, phone_number, post_freshness, repost_mode
                         FROM repost_streams
                         WHERE is_active = 1
                     ''')
@@ -598,8 +598,16 @@ class PostScheduler:
                     streams_count += len(streams)
                     
                     for stream in streams:
-                        stream_id, donor, targets_str, last_id, is_public, phone, _freshness_unused = stream
-                        logger.info(f"Обрабатываем поток репостов {stream_id}: донор={donor}, публичный={is_public}")
+                        stream_id, donor, targets_str, last_id, is_public, phone, _freshness_unused, repost_mode = stream
+                        # приведение типа доноров: поддерживаем JSON-массив в random режиме
+                        donors_list = None
+                        if repost_mode == 'random':
+                            try:
+                                if isinstance(donor, str) and donor.startswith('['):
+                                    donors_list = json.loads(donor)
+                            except Exception:
+                                donors_list = None
+                        logger.info(f"Обрабатываем поток репостов {stream_id}: донор={donor}, публичный={is_public}, режим={repost_mode}")
                         # Определяем session для использования
                         if is_public or not phone:
                             session_string = self.session_string
@@ -621,12 +629,23 @@ class PostScheduler:
                             target_channels = safe_json_loads(targets_str, [])
                         else:
                             target_channels = [int(cid.strip()) for cid in str(targets_str).split(',') if str(cid).strip()]
+                        if not target_channels:
+                            continue
                         logger.info(f"Целевые каналы для потока {stream_id}: {target_channels}")
-                        await self.check_donor_channel(
-                            donor, target_channels, last_id or 0, stream_id, 
-                            session_string, db_file
-                        )
-                        
+
+                        # Если donors_list задан (random+несколько доноров), обрабатываем каждого донора как источник обновлений,
+                        # но публикуем в один случайный target на сообщение
+                        if donors_list and repost_mode == 'random':
+                            for donor_item in donors_list:
+                                await self._process_donor_updates_random_target(
+                                    donor_item, target_channels, last_id or 0, stream_id, session_string, db_file
+                                )
+                        else:
+                            await self.check_donor_channel(
+                                donor, target_channels, last_id or 0, stream_id, 
+                                session_string, db_file
+                            )
+                            
             except Exception as e:
                 logger.error(f"Ошибка обработки потоков в БД {db_file}: {e}")
         
@@ -634,6 +653,217 @@ class PostScheduler:
             logger.info("Активных потоков репостов не найдено")
         else:
             logger.info(f"Обработано {streams_count} потоков репостов")
+
+    async def _process_donor_updates_random_target(self, donor_channel, target_channels, last_message_id, 
+                                                 stream_id, session_string, db_path):
+        """Получаем новые сообщения у донора и публикуем каждое в СЛУЧАЙНЫЙ target один раз."""
+        try:
+            client = await self._get_client(session_string, name_hint=f"stream_{stream_id}")
+            if not client:
+                return
+            # Определяем ID канала
+            if isinstance(donor_channel, str):
+                if donor_channel.startswith('@'):
+                    channel_id = donor_channel
+                elif donor_channel.isdigit():
+                    channel_id = int(donor_channel)
+                else:
+                    channel_id = f"@{donor_channel}"
+            else:
+                channel_id = int(donor_channel)
+
+            if not last_message_id:
+                latest_id = None
+                try:
+                    async for msg in client.get_chat_history(channel_id, limit=1):
+                        latest_id = msg.id
+                        break
+                except Exception:
+                    latest_id = None
+                if latest_id:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE repost_streams SET last_message_id = ? WHERE id = ?",
+                            (latest_id, stream_id)
+                        )
+                        await db.commit()
+                return
+
+            new_messages = []
+            async for message in client.get_chat_history(channel_id, limit=50):
+                if message.id <= (last_message_id or 0):
+                    break
+                if message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.text:
+                    new_messages.append(message)
+
+            for message in reversed(new_messages):
+                # выбираем случайный target
+                target_channel = random.choice(target_channels)
+                try:
+                    # аналогично check_donor_channel, но отправляем только в один target
+                    content_type = 'text'
+                    caption = clean_post_content(message.caption or "")
+                    fingerprint_payload = None
+                    if message.photo:
+                        content_type = 'photo'
+                        fingerprint_payload = {"type": "photo", "caption": caption, "text": None}
+                    elif message.video:
+                        content_type = 'video'
+                        fingerprint_payload = {"type": "video", "caption": caption, "text": None}
+                    elif message.document:
+                        content_type = 'document'
+                        fingerprint_payload = {"type": "document", "caption": caption, "text": None}
+                    elif message.audio:
+                        content_type = 'audio'
+                        fingerprint_payload = {"type": "audio", "caption": caption, "text": None}
+                    elif message.voice:
+                        content_type = 'voice'
+                        fingerprint_payload = {"type": "voice", "caption": None, "text": None}
+                    elif message.sticker:
+                        content_type = 'sticker'
+                        fingerprint_payload = {"type": "sticker", "caption": None, "text": None}
+                    elif message.text:
+                        content_type = 'text'
+                        fingerprint_payload = {"type": "text", "caption": None, "text": clean_post_content(message.text)}
+                    # дедуп
+                    try:
+                        fingerprint = self._make_post_fingerprint(fingerprint_payload or {"type": content_type})
+                        async with aiosqlite.connect(db_path) as db:
+                            ok = await self._reserve_dedup(db, int(target_channel), fingerprint)
+                        if not ok:
+                            continue
+                    except Exception:
+                        pass
+                    # публикация
+                    if content_type == 'photo':
+                        data_obj = await client.download_media(message, in_memory=True)
+                        from io import BytesIO
+                        if isinstance(data_obj, BytesIO):
+                            data = data_obj.getvalue()
+                            await self.bot.send_photo(target_channel, BufferedInputFile(data, filename="photo.jpg"), caption=caption)
+                        elif isinstance(data_obj, (bytes, bytearray)):
+                            await self.bot.send_photo(target_channel, BufferedInputFile(data_obj, filename="photo.jpg"), caption=caption)
+                        else:
+                            with open(str(data_obj), 'rb') as f:
+                                data = f.read()
+                            await self.bot.send_photo(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "photo.jpg"), caption=caption)
+                        try:
+                            if hasattr(data_obj, 'close'):
+                                data_obj.close()
+                            elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                os.remove(data_obj)
+                        except Exception:
+                            pass
+                    elif content_type == 'video':
+                        data_obj = await client.download_media(message, in_memory=True)
+                        from io import BytesIO
+                        if isinstance(data_obj, BytesIO):
+                            data = data_obj.getvalue()
+                            await self.bot.send_video(target_channel, BufferedInputFile(data, filename="video.mp4"), caption=caption)
+                        elif isinstance(data_obj, (bytes, bytearray)):
+                            await self.bot.send_video(target_channel, BufferedInputFile(data_obj, filename="video.mp4"), caption=caption)
+                        else:
+                            with open(str(data_obj), 'rb') as f:
+                                data = f.read()
+                            await self.bot.send_video(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "video.mp4"), caption=caption)
+                        try:
+                            if hasattr(data_obj, 'close'):
+                                data_obj.close()
+                            elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                os.remove(data_obj)
+                        except Exception:
+                            pass
+                    elif content_type == 'document':
+                        data_obj = await client.download_media(message, in_memory=True)
+                        from io import BytesIO
+                        if isinstance(data_obj, BytesIO):
+                            data = data_obj.getvalue()
+                            await self.bot.send_document(target_channel, BufferedInputFile(data, filename="document.bin"), caption=caption)
+                        elif isinstance(data_obj, (bytes, bytearray)):
+                            await self.bot.send_document(target_channel, BufferedInputFile(data_obj, filename="document.bin"), caption=caption)
+                        else:
+                            with open(str(data_obj), 'rb') as f:
+                                data = f.read()
+                            await self.bot.send_document(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "document.bin"), caption=caption)
+                        try:
+                            if hasattr(data_obj, 'close'):
+                                data_obj.close()
+                            elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                os.remove(data_obj)
+                        except Exception:
+                            pass
+                    elif content_type == 'audio':
+                        data_obj = await client.download_media(message, in_memory=True)
+                        from io import BytesIO
+                        if isinstance(data_obj, BytesIO):
+                            data = data_obj.getvalue()
+                            await self.bot.send_audio(target_channel, BufferedInputFile(data, filename="audio.mp3"), caption=caption)
+                        elif isinstance(data_obj, (bytes, bytearray)):
+                            await self.bot.send_audio(target_channel, BufferedInputFile(data_obj, filename="audio.mp3"), caption=caption)
+                        else:
+                            with open(str(data_obj), 'rb') as f:
+                                data = f.read()
+                            await self.bot.send_audio(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "audio.mp3"), caption=caption)
+                        try:
+                            if hasattr(data_obj, 'close'):
+                                data_obj.close()
+                            elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                os.remove(data_obj)
+                        except Exception:
+                            pass
+                    elif content_type == 'voice':
+                        data_obj = await client.download_media(message, in_memory=True)
+                        from io import BytesIO
+                        if isinstance(data_obj, BytesIO):
+                            data = data_obj.getvalue()
+                            await self.bot.send_voice(target_channel, BufferedInputFile(data, filename="voice.ogg"))
+                        elif isinstance(data_obj, (bytes, bytearray)):
+                            await self.bot.send_voice(target_channel, BufferedInputFile(data_obj, filename="voice.ogg"))
+                        else:
+                            with open(str(data_obj), 'rb') as f:
+                                data = f.read()
+                            await self.bot.send_voice(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "voice.ogg"))
+                        try:
+                            if hasattr(data_obj, 'close'):
+                                data_obj.close()
+                            elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                os.remove(data_obj)
+                        except Exception:
+                            pass
+                    elif content_type == 'sticker':
+                        data_obj = await client.download_media(message, in_memory=True)
+                        from io import BytesIO
+                        if isinstance(data_obj, BytesIO):
+                            data = data_obj.getvalue()
+                            await self.bot.send_sticker(target_channel, BufferedInputFile(data, filename="sticker.webp"))
+                        elif isinstance(data_obj, (bytes, bytearray)):
+                            await self.bot.send_sticker(target_channel, BufferedInputFile(data_obj, filename="sticker.webp"))
+                        else:
+                            with open(str(data_obj), 'rb') as f:
+                                data = f.read()
+                            await self.bot.send_sticker(target_channel, BufferedInputFile(data, filename=os.path.basename(str(data_obj)) or "sticker.webp"))
+                        try:
+                            if hasattr(data_obj, 'close'):
+                                data_obj.close()
+                            elif isinstance(data_obj, str) and os.path.exists(data_obj):
+                                os.remove(data_obj)
+                        except Exception:
+                            pass
+                    elif content_type == 'text':
+                        cleaned_text = clean_post_content(message.text)
+                        await self.bot.send_message(target_channel, cleaned_text)
+                    await asyncio.sleep(0.5)
+
+            if new_messages:
+                max_id = max(msg.id for msg in new_messages)
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        "UPDATE repost_streams SET last_message_id = ? WHERE id = ?",
+                        (max_id, stream_id)
+                    )
+                    await db.commit()
+        except Exception as e:
+            logger.error(f"Ошибка random публикации для донор {donor_channel}: {e}")
 
     async def check_donor_channel(self, donor_channel, target_channels, last_message_id, 
                                  stream_id, session_string, db_path):
