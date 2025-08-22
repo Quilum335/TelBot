@@ -570,6 +570,13 @@ async def on_chat_shared(message: types.Message):
             )
         await db.commit()
     await message.answer("✅ Канал привязан! Откройте '📋 Список каналов' для проверки.", reply_markup=ReplyKeyboardRemove())
+    # Показать главное меню после привязки, чтобы кнопка '🔗 Привязать канал' оставалась
+    try:
+        from keyboards import get_main_menu_keyboard
+        user_info = await get_user_info(user_id, username)
+        await message.answer("📱 Главное меню:", reply_markup=get_main_menu_keyboard(user_info))
+    except Exception:
+        pass
 
 # Обработчики команд
 async def cmd_start(message: types.Message):
